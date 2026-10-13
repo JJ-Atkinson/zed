@@ -5500,8 +5500,19 @@ async fn test_remote_execute_lsp_command(cx: &mut TestAppContext, server_cx: &mu
                 fake.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
                     |params, _| async move {
                         assert_eq!(params.command, "the-command");
-                        assert_eq!(params.arguments, vec![json!("foo"), json!(42)]);
-                        Ok(Some(json!({"answer": 3})))
+                        if params.arguments == vec![json!("foo"), json!(42)] {
+                            Ok(Some(json!({"answer": 3})))
+                        } else {
+                            assert_eq!(
+                                params.arguments,
+                                vec![
+                                    json!("file:///code/project1/src/lib.rs"),
+                                    json!(0),
+                                    json!(7)
+                                ]
+                            );
+                            Ok(Some(json!({"answer": 4})))
+                        }
                     },
                 );
             })),
@@ -5521,7 +5532,7 @@ async fn test_remote_execute_lsp_command(cx: &mut TestAppContext, server_cx: &mu
 
     cx.run_until_parked();
 
-    let (_buffer, _handle) = project
+    let (buffer, _handle) = project
         .update(cx, |project, cx| {
             project.open_buffer_with_lsp((worktree_id, rel_path("src/lib.rs")), cx)
         })
@@ -5555,6 +5566,23 @@ async fn test_remote_execute_lsp_command(cx: &mut TestAppContext, server_cx: &mu
         .await
         .expect("executing an advertised command should succeed");
     assert_eq!(result, Some(json!({"answer": 3})));
+
+    let result = project
+        .update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store.execute_lsp_command_for_buffer(
+                    server_id,
+                    buffer.clone(),
+                    language::PointUtf16::new(0, 7),
+                    "the-command".to_string(),
+                    vec![json!("$uri"), json!("$line"), json!("$column")],
+                    cx,
+                )
+            })
+        })
+        .await
+        .expect("executing a command with remote buffer context should succeed");
+    assert_eq!(result, Some(json!({"answer": 4})));
 
     let unadvertised = project
         .update(cx, |project, cx| {

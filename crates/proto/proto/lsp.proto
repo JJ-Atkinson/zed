@@ -993,6 +993,8 @@ message ExecuteLspCommand {
   uint64 language_server_id = 2;
   string command = 3;
   repeated string arguments = 4;
+  optional uint64 buffer_id = 5;
+  optional PointUtf16 position = 6;
 }
 
 message ExecuteLspCommandResponse {

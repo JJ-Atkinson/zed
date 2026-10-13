@@ -105,6 +105,24 @@ pub struct ToggleCodeActions {
     pub quick_launch: bool,
 }
 
+/// Executes a command advertised by a language server for the current buffer.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteLspCommand {
+    /// The language server command to execute.
+    pub command: String,
+    /// JSON arguments to pass to the command. String values equal to `$uri`, `$line`, or
+    /// `$column` are replaced with the current document URI and zero-based UTF-16 cursor
+    /// position.
+    #[serde(default)]
+    pub arguments: Vec<serde_json::Value>,
+    /// The language server to use. When omitted, exactly one relevant server must advertise the
+    /// command.
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
 #[derive(PartialEq, Clone, Debug)]
 pub enum CodeActionSource {
     Indicator(DisplayRow),
@@ -313,6 +331,12 @@ pub struct FoldAtLevel(pub u32);
 pub struct SpawnNearestTask {
     #[serde(default)]
     pub reveal: task::RevealStrategy,
+    /// Custom task variables, referenced as `$ZED_CUSTOM_<name>`.
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
+    /// Build task variables from the current selection instead of the runnable's start.
+    #[serde(default)]
+    pub use_selection_context: bool,
 }
 
 #[derive(Clone, PartialEq, Action)]

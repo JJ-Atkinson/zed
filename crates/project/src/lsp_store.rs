@@ -183,6 +183,66 @@ const DOCUMENT_DIAGNOSTICS_RETRIGGER_DELAY: Duration = Duration::from_millis(100
 const SERVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_PROMPT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
+fn expand_lsp_command_arguments(
+    buffer: &Buffer,
+    position: PointUtf16,
+    arguments: Vec<serde_json::Value>,
+    cx: &App,
+) -> Result<Vec<serde_json::Value>> {
+    fn expand_value(
+        value: serde_json::Value,
+        buffer: &Buffer,
+        position: PointUtf16,
+        uri: &mut Option<String>,
+        cx: &App,
+    ) -> Result<serde_json::Value> {
+        match value {
+            serde_json::Value::String(value) if value == "$uri" => {
+                let uri = match uri {
+                    Some(uri) => uri.clone(),
+                    None => {
+                        let path = buffer
+                            .file()
+                            .and_then(|file| file.file_system_abs_path(cx))
+                            .context(
+                                "the current buffer has no file path for the $uri placeholder",
+                            )?;
+                        let value = file_path_to_lsp_url(&path)?.to_string();
+                        *uri = Some(value.clone());
+                        value
+                    }
+                };
+                Ok(serde_json::Value::String(uri))
+            }
+            serde_json::Value::String(value) if value == "$line" => {
+                Ok(serde_json::Value::Number(position.row.into()))
+            }
+            serde_json::Value::String(value) if value == "$column" => {
+                Ok(serde_json::Value::Number(position.column.into()))
+            }
+            serde_json::Value::Array(values) => Ok(serde_json::Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| expand_value(value, buffer, position, uri, cx))
+                    .collect::<Result<_>>()?,
+            )),
+            serde_json::Value::Object(values) => Ok(serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, expand_value(value, buffer, position, uri, cx)?)))
+                    .collect::<Result<_>>()?,
+            )),
+            value => Ok(value),
+        }
+    }
+
+    let mut uri = None;
+    arguments
+        .into_iter()
+        .map(|argument| expand_value(argument, buffer, position, &mut uri, cx))
+        .collect()
+}
+
 /// Refresh messages carry a monotonic id for backwards compatibility only: older peers
 /// use it to order refreshes, while current ones re-mark pending refreshes on arrival.
 /// The envelope's own message id cannot be used, as old peers compare the payload field.
@@ -6695,6 +6755,8 @@ impl LspStore {
                     .iter()
                     .map(|argument| argument.to_string())
                     .collect(),
+                buffer_id: None,
+                position: None,
             });
             cx.background_spawn(async move {
                 let response = request.await?;
@@ -6735,6 +6797,50 @@ impl LspStore {
                     .await
                     .into_response()
             })
+        } else {
+            Task::ready(Err(anyhow!("no upstream client and not local")))
+        }
+    }
+
+    pub fn execute_lsp_command_for_buffer(
+        &self,
+        server_id: LanguageServerId,
+        buffer: Entity<Buffer>,
+        position: PointUtf16,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<serde_json::Value>>> {
+        if let Some((upstream_client, project_id)) = self.upstream_client() {
+            let request = upstream_client.request(proto::ExecuteLspCommand {
+                project_id,
+                language_server_id: server_id.to_proto(),
+                command,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| argument.to_string())
+                    .collect(),
+                buffer_id: Some(buffer.read(cx).remote_id().into()),
+                position: Some(proto::PointUtf16 {
+                    row: position.row,
+                    column: position.column,
+                }),
+            });
+            cx.background_spawn(async move {
+                let response = request.await?;
+                response
+                    .result
+                    .map(|result| serde_json::from_str(&result))
+                    .transpose()
+                    .context("deserializing executeCommand result")
+            })
+        } else if self.mode.is_local() {
+            let arguments =
+                match expand_lsp_command_arguments(buffer.read(cx), position, arguments, cx) {
+                    Ok(arguments) => arguments,
+                    Err(error) => return Task::ready(Err(error)),
+                };
+            self.execute_lsp_command(server_id, command, arguments, cx)
         } else {
             Task::ready(Err(anyhow!("no upstream client and not local")))
         }
@@ -11599,18 +11705,37 @@ impl LspStore {
         envelope: TypedEnvelope<proto::ExecuteLspCommand>,
         mut cx: AsyncApp,
     ) -> Result<proto::ExecuteLspCommandResponse> {
-        let server_id = LanguageServerId::from_proto(envelope.payload.language_server_id);
-        let arguments = envelope
-            .payload
+        let payload = envelope.payload;
+        let server_id = LanguageServerId::from_proto(payload.language_server_id);
+        let arguments = payload
             .arguments
             .iter()
             .map(|argument| serde_json::from_str(argument))
             .collect::<Result<Vec<serde_json::Value>, _>>()
             .context("deserializing executeCommand arguments")?;
+        let command_context = match (payload.buffer_id, payload.position) {
+            (Some(buffer_id), Some(position)) => Some((buffer_id, position)),
+            (None, None) => None,
+            _ => return Err(anyhow!("incomplete executeCommand buffer context")),
+        };
         let result = lsp_store
-            .update(&mut cx, |lsp_store, cx| {
-                lsp_store.execute_lsp_command(server_id, envelope.payload.command, arguments, cx)
+            .update(&mut cx, |lsp_store, cx| -> Result<_> {
+                if let Some((buffer_id, position)) = command_context {
+                    let buffer_id = BufferId::new(buffer_id)?;
+                    let buffer = lsp_store.buffer_store.read(cx).get_existing(buffer_id)?;
+                    Ok(lsp_store.execute_lsp_command_for_buffer(
+                        server_id,
+                        buffer,
+                        PointUtf16::new(position.row, position.column),
+                        payload.command,
+                        arguments,
+                        cx,
+                    ))
+                } else {
+                    Ok(lsp_store.execute_lsp_command(server_id, payload.command, arguments, cx))
+                }
             })
+            .context("preparing executeCommand request")?
             .await?;
         Ok(proto::ExecuteLspCommandResponse {
             result: result.map(|result| result.to_string()),

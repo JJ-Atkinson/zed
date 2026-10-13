@@ -388,3 +388,32 @@ To override the shell used for tasks, configure the `terminal.shell` setting:
 ```
 
 See [Terminal configuration](./terminal.md) for complete shell options.
+
+## Passing Custom Variables from Keybindings
+
+`editor::SpawnNearestTask` accepts custom variables that task templates can
+reference with the `$ZED_CUSTOM_` prefix:
+
+```json [keymap]
+{
+  "context": "Editor",
+  "bindings": {
+    "ctrl-alt-t": [
+      "editor::SpawnNearestTask",
+      {
+        "reveal": "never",
+        "use_selection_context": true,
+        "variables": {
+          "operation": "test"
+        }
+      }
+    ]
+  }
+}
+```
+
+A runnable task can read this value as `$ZED_CUSTOM_operation`. Explicit
+keybinding variables override captures with the same name from the runnable
+query. With `use_selection_context`, ordinary variables such as
+`$ZED_SELECTED_TEXT`, `$ZED_ROW`, and `$ZED_COLUMN` describe the current
+selection rather than the runnable's starting position.

@@ -22,6 +22,27 @@ use crate::{
     display_map::{DisplayPoint, DisplayRow},
 };
 
+fn insert_custom_task_variables(
+    task_variables: &mut TaskVariables,
+    variables: impl IntoIterator<Item = (String, String)>,
+) {
+    for (name, value) in variables {
+        task_variables.insert(VariableName::Custom(name.into()), value);
+    }
+}
+
+fn insert_runnable_task_variables(
+    task_variables: &mut TaskVariables,
+    variables: &HashMap<String, String>,
+) {
+    for (name, value) in variables {
+        let variable_name = VariableName::Custom(name.to_owned().into());
+        if !name.starts_with('_') && task_variables.get(&variable_name).is_none() {
+            task_variables.insert(variable_name, value.to_owned());
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct RunnableData {
     runnables: HashMap<BufferId, (Global, BTreeMap<BufferRow, RunnableTasks>)>,
@@ -367,9 +388,22 @@ impl Editor {
         let buffer_id = buffer.read(cx).remote_id();
         let editor = cx.weak_entity();
         let reveal_strategy = action.reveal;
-        let task_context = Self::build_tasks_context(&project, &buffer, buffer_row, &tasks, cx);
+        let action_variables = action.variables.clone();
+        let selection_task_context = action
+            .use_selection_context
+            .then(|| self.task_context(window, cx));
+        let runnable_task_context =
+            Self::build_tasks_context(&project, &buffer, buffer_row, &tasks, cx);
         cx.spawn_in(window, async move |_, cx| {
-            let context = task_context.await.ok().flatten()?;
+            let mut context = match selection_task_context {
+                Some(selection_task_context) => match selection_task_context.await {
+                    Some(context) => context,
+                    None => runnable_task_context.await.ok().flatten()?,
+                },
+                None => runnable_task_context.await.ok().flatten()?,
+            };
+            insert_runnable_task_variables(&mut context.task_variables, &tasks.extra_variables);
+            insert_custom_task_variables(&mut context.task_variables, action_variables);
             let (task_source_kind, mut resolved_task) = tasks.resolve(&context).next()?;
 
             let resolved = &mut resolved_task.resolved;
@@ -855,6 +889,8 @@ impl Editor {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use super::{insert_custom_task_variables, insert_runnable_task_variables};
+    use collections::HashMap;
     use futures::StreamExt as _;
     use gpui::{AppContext as _, Entity, Task, TestAppContext};
     use indoc::indoc;
@@ -869,7 +905,7 @@ mod tests {
         },
     };
     use serde_json::json;
-    use task::{TaskTemplate, TaskTemplates};
+    use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
     use text::Point;
     use util::path;
     use util::rel_path::rel_path;
@@ -880,6 +916,40 @@ mod tests {
     };
 
     const FAKE_LSP_NAME: &str = "the-fake-language-server";
+
+    #[test]
+    fn action_custom_task_variables_override_runnable_captures() {
+        let mut variables = TaskVariables::default();
+        variables.insert(
+            VariableName::Custom("form".into()),
+            "from-selection".to_string(),
+        );
+        insert_runnable_task_variables(
+            &mut variables,
+            &HashMap::from_iter([
+                ("snippet".to_string(), "captured".to_string()),
+                ("form".to_string(), "from-runnable".to_string()),
+                ("_internal".to_string(), "hidden".to_string()),
+            ]),
+        );
+        insert_custom_task_variables(
+            &mut variables,
+            [("snippet".to_string(), "from-keymap".to_string())],
+        );
+
+        assert_eq!(
+            variables.get(&VariableName::Custom("snippet".into())),
+            Some("from-keymap")
+        );
+        assert_eq!(
+            variables.get(&VariableName::Custom("form".into())),
+            Some("from-selection")
+        );
+        assert_eq!(
+            variables.get(&VariableName::Custom("_internal".into())),
+            None
+        );
+    }
 
     struct TestRustContextProvider;
 

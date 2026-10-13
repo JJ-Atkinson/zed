@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::Editor;
+use crate::{Editor, ExecuteLspCommand};
+use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use futures::TryFutureExt;
 use gpui::{App, Entity, Task};
@@ -17,9 +18,117 @@ use project::TaskSourceKind;
 use project::lsp_store::lsp_ext_command::GetLspRunnables;
 use task::ResolvedTask;
 use task::TaskContext;
-use text::BufferId;
+use text::{BufferId, ToPointUtf16 as _};
 use ui::SharedString;
 use util::ResultExt as _;
+
+impl Editor {
+    pub(crate) fn execute_lsp_command(
+        &self,
+        action: &ExecuteLspCommand,
+        cx: &mut App,
+    ) -> Task<Result<Option<serde_json::Value>>> {
+        let result = (|| {
+            let project = self
+                .project
+                .clone()
+                .context("cannot execute an LSP command without a project")?;
+            let multi_buffer = self.buffer.read(cx);
+            let multi_buffer_snapshot = multi_buffer.snapshot(cx);
+            let (buffer_position, _) = multi_buffer_snapshot
+                .anchor_to_buffer_anchor(self.selections.newest_anchor().head())
+                .context("the current selection is not in a language buffer")?;
+            let buffer = multi_buffer
+                .buffer(buffer_position.buffer_id)
+                .context("the current language buffer is no longer available")?;
+
+            let position = buffer_position.to_point_utf16(&buffer.read(cx).snapshot());
+            let project_ref = project.read(cx);
+            let lsp_store = project_ref.lsp_store().read(cx);
+            let buffer_ref = buffer.read(cx);
+            let adapters = buffer_ref
+                .language_at(buffer_position)
+                .map(|language| project_ref.languages().lsp_adapters(&language.name()))
+                .unwrap_or_default();
+            let relevant_server_names = adapters
+                .iter()
+                .map(|adapter| adapter.name())
+                .collect::<HashSet<_>>();
+            let buffer_worktree = buffer_ref.file().map(|file| file.worktree_id(cx));
+            let opened_in_servers =
+                lsp_store.language_server_ids_for_opened_buffer(buffer_ref.remote_id());
+            let mut candidates = project_ref
+                .language_server_statuses(cx)
+                .filter(|(server_id, status)| {
+                    relevant_server_names.contains(&status.name)
+                        && match (opened_in_servers, buffer_worktree, status.worktree) {
+                            (Some(server_ids), _, _) => server_ids.contains(server_id),
+                            (None, Some(buffer_worktree), Some(server_worktree)) => {
+                                buffer_worktree == server_worktree
+                            }
+                            (None, _, _) => true,
+                        }
+                })
+                .filter(|(server_id, status)| {
+                    action
+                        .server
+                        .as_ref()
+                        .is_none_or(|server| status.name.0.as_ref() == server)
+                        && lsp_store
+                            .lsp_server_capabilities
+                            .get(server_id)
+                            .and_then(|capabilities| capabilities.execute_command_provider.as_ref())
+                            .is_some_and(|provider| provider.commands.contains(&action.command))
+                })
+                .map(|(server_id, status)| (server_id, status.name.clone()))
+                .collect::<Vec<_>>();
+            candidates.sort_by(|(_, left), (_, right)| left.0.cmp(&right.0));
+
+            let server_id = match candidates.as_slice() {
+                [(server_id, _)] => *server_id,
+                [] => {
+                    return Err(match &action.server {
+                        Some(server) => anyhow!(
+                            "language server {server:?} does not advertise command {:?} for the current buffer",
+                            action.command
+                        ),
+                        None => anyhow!(
+                            "no language server advertises command {:?} for the current buffer",
+                            action.command
+                        ),
+                    });
+                }
+                candidates => {
+                    let server_names = candidates
+                        .iter()
+                        .map(|(_, name)| name.0.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(anyhow!(
+                        "multiple language servers advertise command {:?} for the current buffer: {server_names}; specify the server field",
+                        action.command
+                    ));
+                }
+            };
+
+            Ok(project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store.execute_lsp_command_for_buffer(
+                    server_id,
+                    buffer,
+                    position,
+                    action.command.clone(),
+                    action.arguments.clone(),
+                    cx,
+                )
+            }))
+        })();
+
+        match result {
+            Ok(task) => task,
+            Err(error) => Task::ready(Err(error)),
+        }
+    }
+}
 
 pub(crate) fn find_specific_language_server_in_selection<F>(
     editor: &Editor,
@@ -195,9 +304,12 @@ mod tests {
     use lsp::{LanguageServerId, LanguageServerName};
     use multi_buffer::MultiBuffer;
     use project::{FakeFs, Project};
+    use serde_json::json;
     use util::path;
 
-    use crate::{MoveToEnd, editor_tests::init_test, test::build_editor_with_project};
+    use crate::{
+        ExecuteLspCommand, MoveToEnd, editor_tests::init_test, test::build_editor_with_project,
+    };
 
     use super::find_specific_language_server_in_selection;
 
@@ -278,5 +390,205 @@ mod tests {
                 "should find correct language server at end of file",
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_execute_lsp_command_expands_buffer_placeholders(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_file(path!("/file.rs"), "a🙂".into()).await;
+
+        let project = Project::test(fs, [path!("/file.rs").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                        commands: vec!["test-command".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let underlying_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/file.rs"), cx)
+            })
+            .await
+            .expect("opening test buffer should succeed");
+        let buffer = cx.new(|cx| MultiBuffer::singleton(underlying_buffer, cx));
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            build_editor_with_project(project.clone(), buffer, window, cx)
+        });
+
+        let fake_server = fake_servers
+            .next()
+            .await
+            .expect("fake language server should start");
+        cx.executor().run_until_parked();
+        fake_server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+            |params, _| async move {
+                assert_eq!(params.command, "test-command");
+                assert_eq!(
+                    params.arguments,
+                    vec![
+                        json!("file:///file.rs"),
+                        json!(0),
+                        json!(3),
+                        json!("literal-$line"),
+                        json!({"nested": 3}),
+                    ]
+                );
+                Ok(Some(json!({"executed": true})))
+            },
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_end(&MoveToEnd, window, cx);
+        });
+        for server in [None, Some("the-fake-language-server".to_string())] {
+            let result = editor
+                .update(cx, |editor, cx| {
+                    editor.execute_lsp_command(
+                        &ExecuteLspCommand {
+                            command: "test-command".to_string(),
+                            arguments: vec![
+                                json!("$uri"),
+                                json!("$line"),
+                                json!("$column"),
+                                json!("literal-$line"),
+                                json!({"nested": "$column"}),
+                            ],
+                            server,
+                        },
+                        cx,
+                    )
+                })
+                .await
+                .expect("executing command should succeed");
+            assert_eq!(result, Some(json!({"executed": true})));
+        }
+
+        let error = editor
+            .update(cx, |editor, cx| {
+                editor.execute_lsp_command(
+                    &ExecuteLspCommand {
+                        command: "unadvertised-command".to_string(),
+                        arguments: Vec::new(),
+                        server: None,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect_err("an unadvertised command should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("no language server advertises command")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_execute_lsp_command_requires_unambiguous_server(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_file(path!("/file.rs"), "fn main() {}".into())
+            .await;
+
+        let project = Project::test(fs, [path!("/file.rs").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+        let capabilities = lsp::ServerCapabilities {
+            execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                commands: vec!["shared-command".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut first_server = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "server-a",
+                capabilities: capabilities.clone(),
+                ..Default::default()
+            },
+        );
+        let mut second_server = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "server-b",
+                capabilities,
+                ..Default::default()
+            },
+        );
+
+        let underlying_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/file.rs"), cx)
+            })
+            .await
+            .expect("opening test buffer should succeed");
+        let buffer = cx.new(|cx| MultiBuffer::singleton(underlying_buffer, cx));
+        let (editor, cx) =
+            cx.add_window_view(|window, cx| build_editor_with_project(project, buffer, window, cx));
+
+        let first_server = first_server
+            .next()
+            .await
+            .expect("first fake language server should start");
+        let second_server = second_server
+            .next()
+            .await
+            .expect("second fake language server should start");
+        cx.executor().run_until_parked();
+        first_server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(|_, _| async move {
+            Ok(Some(json!("server-a")))
+        });
+        second_server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+            |_, _| async move { Ok(Some(json!("server-b"))) },
+        );
+
+        let result = editor
+            .update(cx, |editor, cx| {
+                editor.execute_lsp_command(
+                    &ExecuteLspCommand {
+                        command: "shared-command".to_string(),
+                        arguments: Vec::new(),
+                        server: Some("server-b".to_string()),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("an explicit language server should resolve ambiguity");
+        assert_eq!(result, Some(json!("server-b")));
+
+        let error = editor
+            .update(cx, |editor, cx| {
+                editor.execute_lsp_command(
+                    &ExecuteLspCommand {
+                        command: "shared-command".to_string(),
+                        arguments: Vec::new(),
+                        server: None,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect_err("ambiguous language servers should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple language servers advertise command")
+        );
+        assert!(error.to_string().contains("server-a, server-b"));
     }
 }
